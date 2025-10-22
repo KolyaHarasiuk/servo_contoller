@@ -1,6 +1,11 @@
 /**
  * Servo Controller with CRSF for STM32G431CBU6
  * Controls 3 servos and 3 GPIO outputs based on CRSF channel 12
+ * 
+ * Features:
+ * - CRSF failsafe detection (holds last position)
+ * - 100ms debounce for servo position changes
+ * - LED status indication
  */
 
 #include "stm32g4xx_hal.h"
@@ -15,6 +20,7 @@
 #define OUTPUT1_PIN     GPIO_PIN_6  // PB6
 #define OUTPUT2_PIN     GPIO_PIN_8  // PB8
 #define SAFETY_OUT_PIN  GPIO_PIN_11 // PC11 - Safety mirror
+#define LED_PIN         GPIO_PIN_13 // PC13 - Status LED
 
 // CRSF on PA3 (USART2_RX)
 
@@ -38,6 +44,13 @@
 #define CRSF_CHANNEL_MAX 1811
 #define CRSF_CHANNEL_MID 992
 
+// CRSF flags
+#define CRSF_FLAG_FAILSAFE_ACTIVE 0x04  // Bit 2 in flags byte
+
+/* Timing definitions */
+#define SERVO_DEBOUNCE_TIME 100     // 100ms debounce for servo changes
+#define CONNECTION_TIMEOUT  1000    // 1 second timeout for LED indication
+
 /* Handle declarations */
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
@@ -50,6 +63,26 @@ uint16_t crsf_channels[16];
 uint32_t crsf_last_packet_time = 0;
 uint8_t crsf_rx_byte;
 
+/* Servo debounce structure */
+typedef struct {
+    uint8_t current_state;      // 0 = closed, 1 = open
+    uint8_t desired_state;      // Desired state
+    uint32_t change_start_time; // Time when change was requested
+    uint8_t is_changing;        // Flag indicating change in progress
+} ServoState_t;
+
+ServoState_t servo_states[3] = {0};
+
+/* LED states */
+typedef enum {
+    LED_STATE_CONNECTED = 0,  // Normal operation - LED ON
+    LED_STATE_FAILSAFE = 1,   // Failsafe - fast blink
+    LED_STATE_NO_SIGNAL = 2   // No packets - slow blink
+} LED_State_t;
+
+LED_State_t led_state = LED_STATE_NO_SIGNAL;
+uint32_t led_last_toggle = 0;
+
 /* Function prototypes */
 void SystemClock_Config(void);
 void GPIO_Init(void);
@@ -58,6 +91,7 @@ void TIM3_Init(void);
 void USART2_Init(void);
 void Error_Handler(void);
 void UpdateOutputs(void);
+void UpdateLED(void);
 void ProcessCRSFPacket(void);
 uint8_t CalculateCRC8(const uint8_t *data, uint8_t len);
 void ParseCRSFChannels(const uint8_t *data);
@@ -93,17 +127,22 @@ int main(void)
         crsf_channels[i] = CRSF_CHANNEL_MID;
     }
     
+    /* Initialize servo states (all closed) */
+    for (int i = 0; i < 3; i++) {
+        servo_states[i].current_state = 0;  // Closed
+        servo_states[i].desired_state = 0;
+        servo_states[i].is_changing = 0;
+    }
+    
     /* Main loop */
     while (1)
     {
         UpdateOutputs();
+        UpdateLED();
         
-        /* Check for CRSF timeout (100ms) */
-        if ((HAL_GetTick() - crsf_last_packet_time) > 100) {
-            /* No valid packet received, set channels to safe position */
-            for (int i = 0; i < 16; i++) {
-                crsf_channels[i] = CRSF_CHANNEL_MID;
-            }
+        /* Check for connection timeout (for LED indication only) */
+        if ((HAL_GetTick() - crsf_last_packet_time) > CONNECTION_TIMEOUT) {
+            led_state = LED_STATE_NO_SIGNAL;
         }
         
         HAL_Delay(5);  // 5ms update rate
@@ -120,42 +159,127 @@ void UpdateOutputs(void)
     
     /* Get channel 12 value (index 11) */
     uint16_t ch12 = crsf_channels[11];
+    uint32_t now = HAL_GetTick();
     
     /* Servo 0 logic: open when ch12 = 172-992 */
-    uint8_t servo0_open = (ch12 <= 992);
-    if (servo0_open) {
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_MIN);  // 1ms - open
+    uint8_t servo0_desired = (ch12 <= 992) ? 1 : 0;
+    
+    if (servo0_desired != servo_states[0].current_state) {
+        if (!servo_states[0].is_changing) {
+            /* Start debounce timer */
+            servo_states[0].is_changing = 1;
+            servo_states[0].desired_state = servo0_desired;
+            servo_states[0].change_start_time = now;
+        } else {
+            /* Check if enough time has passed */
+            if ((now - servo_states[0].change_start_time) >= SERVO_DEBOUNCE_TIME) {
+                /* Verify desired state hasn't changed */
+                if (servo0_desired == servo_states[0].desired_state) {
+                    /* Apply change */
+                    servo_states[0].current_state = servo0_desired;
+                    if (servo0_desired) {
+                        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_MIN);  // Open
+                    } else {
+                        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_MAX);  // Closed
+                    }
+                }
+                servo_states[0].is_changing = 0;
+            }
+        }
     } else {
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, SERVO_MAX);  // 2ms - closed
+        /* Desired state matches current state, reset debounce */
+        servo_states[0].is_changing = 0;
     }
     
     /* Servo 1 logic: open when ch12 = 337-1320 */
-    uint8_t servo1_open = (ch12 >= 337 && ch12 <= 1320);
-    if (servo1_open) {
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, SERVO_MIN);  // 1ms - open
+    uint8_t servo1_desired = (ch12 >= 337 && ch12 <= 1320) ? 1 : 0;
+    
+    if (servo1_desired != servo_states[1].current_state) {
+        if (!servo_states[1].is_changing) {
+            servo_states[1].is_changing = 1;
+            servo_states[1].desired_state = servo1_desired;
+            servo_states[1].change_start_time = now;
+        } else {
+            if ((now - servo_states[1].change_start_time) >= SERVO_DEBOUNCE_TIME) {
+                if (servo1_desired == servo_states[1].desired_state) {
+                    servo_states[1].current_state = servo1_desired;
+                    if (servo1_desired) {
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, SERVO_MIN);  // Open
+                    } else {
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, SERVO_MAX);  // Closed
+                    }
+                }
+                servo_states[1].is_changing = 0;
+            }
+        }
     } else {
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, SERVO_MAX);  // 2ms - closed
+        servo_states[1].is_changing = 0;
     }
     
     /* Servo 2 logic: open when ch12 = 665-1648 */
-    uint8_t servo2_open = (ch12 >= 665 && ch12 <= 1648);
-    if (servo2_open) {
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, SERVO_MIN);  // 1ms - open
+    uint8_t servo2_desired = (ch12 >= 665 && ch12 <= 1648) ? 1 : 0;
+    
+    if (servo2_desired != servo_states[2].current_state) {
+        if (!servo_states[2].is_changing) {
+            servo_states[2].is_changing = 1;
+            servo_states[2].desired_state = servo2_desired;
+            servo_states[2].change_start_time = now;
+        } else {
+            if ((now - servo_states[2].change_start_time) >= SERVO_DEBOUNCE_TIME) {
+                if (servo2_desired == servo_states[2].desired_state) {
+                    servo_states[2].current_state = servo2_desired;
+                    if (servo2_desired) {
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, SERVO_MIN);  // Open
+                    } else {
+                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, SERVO_MAX);  // Closed
+                    }
+                }
+                servo_states[2].is_changing = 0;
+            }
+        }
     } else {
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, SERVO_MAX);  // 2ms - closed
+        servo_states[2].is_changing = 0;
     }
     
     /* Update GPIO outputs based on safety switch */
     if (safety) {
         /* Safety ON - outputs follow servo states */
-        HAL_GPIO_WritePin(GPIOB, OUTPUT0_PIN, servo0_open);
-        HAL_GPIO_WritePin(GPIOB, OUTPUT1_PIN, servo1_open);
-        HAL_GPIO_WritePin(GPIOB, OUTPUT2_PIN, servo2_open);
+        HAL_GPIO_WritePin(GPIOB, OUTPUT0_PIN, servo_states[0].current_state);
+        HAL_GPIO_WritePin(GPIOB, OUTPUT1_PIN, servo_states[1].current_state);
+        HAL_GPIO_WritePin(GPIOB, OUTPUT2_PIN, servo_states[2].current_state);
     } else {
         /* Safety OFF - all outputs LOW */
         HAL_GPIO_WritePin(GPIOB, OUTPUT0_PIN, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOB, OUTPUT1_PIN, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOB, OUTPUT2_PIN, GPIO_PIN_RESET);
+    }
+}
+
+void UpdateLED(void)
+{
+    uint32_t now = HAL_GetTick();
+    
+    switch (led_state) {
+        case LED_STATE_CONNECTED:
+            /* Constantly ON */
+            HAL_GPIO_WritePin(GPIOC, LED_PIN, GPIO_PIN_SET);
+            break;
+            
+        case LED_STATE_FAILSAFE:
+            /* Fast blink 5 Hz (100ms on/100ms off) */
+            if ((now - led_last_toggle) >= 100) {
+                HAL_GPIO_TogglePin(GPIOC, LED_PIN);
+                led_last_toggle = now;
+            }
+            break;
+            
+        case LED_STATE_NO_SIGNAL:
+            /* Slow blink 1 Hz (500ms on/500ms off) */
+            if ((now - led_last_toggle) >= 500) {
+                HAL_GPIO_TogglePin(GPIOC, LED_PIN);
+                led_last_toggle = now;
+            }
+            break;
     }
 }
 
@@ -207,7 +331,17 @@ void ProcessCRSFPacket(void)
     
     /* Process RC channels packet */
     if (frame_type == CRSF_FRAMETYPE_RC_CHANNELS_PACKED) {
-        ParseCRSFChannels(&crsf_rx_buffer[3]);
+        uint8_t flags = crsf_rx_buffer[25];  // Flags byte
+        
+        if (!(flags & CRSF_FLAG_FAILSAFE_ACTIVE)) {
+            /* Failsafe NOT active - update channels */
+            ParseCRSFChannels(&crsf_rx_buffer[3]);
+            led_state = LED_STATE_CONNECTED;
+        } else {
+            /* Failsafe active - keep old values */
+            led_state = LED_STATE_FAILSAFE;
+        }
+        
         crsf_last_packet_time = HAL_GetTick();
     }
 }
@@ -275,6 +409,14 @@ void GPIO_Init(void)
     /* Configure safety mirror output (PC11) */
     HAL_GPIO_WritePin(GPIOC, SAFETY_OUT_PIN, GPIO_PIN_RESET);
     GPIO_InitStruct.Pin = SAFETY_OUT_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    
+    /* Configure LED pin (PC13) */
+    HAL_GPIO_WritePin(GPIOC, LED_PIN, GPIO_PIN_RESET);
+    GPIO_InitStruct.Pin = LED_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
