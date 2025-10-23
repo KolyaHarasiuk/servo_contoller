@@ -98,13 +98,7 @@ int main(void)
     {
         UpdateOutputs();
         
-        /* Check for CRSF timeout (100ms) */
-        if ((HAL_GetTick() - crsf_last_packet_time) > 100) {
-            /* No valid packet received, set channels to safe position */
-            for (int i = 0; i < 16; i++) {
-                crsf_channels[i] = CRSF_CHANNEL_MID;
-            }
-        }
+       
         
         HAL_Delay(5);  // 5ms update rate
     }
@@ -147,12 +141,12 @@ void UpdateOutputs(void)
     
     /* Update GPIO outputs based on safety switch */
     if (safety) {
-        /* Safety ON - outputs follow servo states */
+        /* Safety OFF - outputs follow servo states */
         HAL_GPIO_WritePin(GPIOB, OUTPUT0_PIN, servo0_open);
         HAL_GPIO_WritePin(GPIOB, OUTPUT1_PIN, servo1_open);
         HAL_GPIO_WritePin(GPIOB, OUTPUT2_PIN, servo2_open);
     } else {
-        /* Safety OFF - all outputs LOW */
+        /* Safety ON - all outputs LOW */
         HAL_GPIO_WritePin(GPIOB, OUTPUT0_PIN, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOB, OUTPUT1_PIN, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOB, OUTPUT2_PIN, GPIO_PIN_RESET);
